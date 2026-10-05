@@ -41,6 +41,28 @@ def test_building_allows_empty_crop_and_growth():
     assert data["crop_type"] == ""
 
 
+def test_building_and_fallow_clear_crop_and_growth_on_load_and_export(tmp_path):
+    building = FULL.replace("نوع الاستخدام: زراعة", "نوع الاستخدام: مباني")
+    fallow = FULL.replace("نوع الاستخدام: زراعة", "نوع الاستخدام: بور").replace(
+        "7bb79feb-f029-4adb-a56c-33b8b3c5db0f", "d6d12fe7-bbb1-4fca-a9c8-ffb6cccbb4dc"
+    )
+    source = tmp_path / "non-agricultural.kml"
+    source.write_text(
+        kml(
+            ("7bb79feb-f029-4adb-a56c-33b8b3c5db0f", building),
+            ("d6d12fe7-bbb1-4fca-a9c8-ffb6cccbb4dc", fallow),
+        ),
+        encoding="utf-8",
+    )
+    document = KmlDocument.load(source)
+    assert all(not parcel.data["crop_type"] for parcel in document.parcels)
+    assert all(not parcel.data["growth_stage"] for parcel in document.parcels)
+    output = tmp_path / "non-agricultural-out.kml"
+    document.export_kml(output)
+    text = output.read_text(encoding="utf-8")
+    assert "نوع المحصول" not in text and "مراحل النمو" not in text
+
+
 def test_html_description_and_excel_export(tmp_path):
     html = "<table><tr><td>ID:</td><td>7bb79feb-f029-4adb-a56c-33b8b3c5db0f</td></tr>" + "<tr><td>رقم الحيازة:</td><td>151</td></tr></table>" + FULL.split("رقم الحيازة: 151، عدد القطع: 1", 1)[1]
     # The direct parser receives mixed HTML/text; its text cleanup keeps Arabic labels readable.

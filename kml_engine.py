@@ -177,6 +177,12 @@ def is_agricultural(data: dict[str, str]) -> bool:
     return "زراع" in normalize_arabic(data.get("land_use", ""))
 
 
+def must_clear_crop_and_growth(data: dict[str, str]) -> bool:
+    """Building and fallow parcels must never carry crop or growth-stage values."""
+    land_use = normalize_arabic(data.get("land_use", ""))
+    return "مبان" in land_use or "بور" in land_use
+
+
 def must_use_fruiting_stage(data: dict[str, str]) -> bool:
     crop = normalize_arabic(data.get("crop_type", ""))
     return any(crop == name or crop.startswith(name + " ") for name in FRUITING_CROPS)
@@ -561,6 +567,9 @@ class KmlDocument:
     def analyze(self) -> None:
         for parcel in self.parcels:
             retain_review = parcel.retained_review and not parcel.review_confirmed
+            if must_clear_crop_and_growth(parcel.data):
+                parcel.data["crop_type"] = ""
+                parcel.data["growth_stage"] = ""
             parcel.missing = [
                 dict(FIELDS)[key]
                 for key in REQUIRED
