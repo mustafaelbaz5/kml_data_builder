@@ -11,6 +11,7 @@ QLabel#fileChip { color: #E9F5FF; background: #1D4B70; border: 1px solid #427397
 QLabel#sectionTitle { color: #102A43; font-size: 17px; font-weight: 700; background: transparent; }
 QLabel#muted { color: #52657A; background: transparent; }
 QLabel#statusNote { color: #1E3A5F; background: #EAF3FF; border: 1px solid #BED8F2; border-radius: 7px; padding: 8px; }
+QLabel#fieldLabel { color: #27435E; background: #EAF1F8; border: 1px solid #CBD9E7; border-radius: 6px; padding: 8px; font-weight: 700; }
 QPushButton { background: #FFFFFF; color: #102A43; border: 1px solid #9EB4C8; border-radius: 7px; padding: 8px 12px; font-weight: 600; min-height: 18px; }
 QPushButton:hover { background: #E7F1FA; border-color: #467FAE; }
 QPushButton:disabled { background: #E9EEF3; color: #8493A3; border-color: #D5DDE6; }
@@ -31,7 +32,8 @@ QStatusBar { color: #27435E; background: #EAF1F8; }
 """
 
 STATUS_COLORS = {
-    "valid": "#166534", "title_mismatch": "#A16207", "empty": "#B42318",
+    "valid": "#166534", "unallocated": "#166534", "title_mismatch": "#A16207", "empty": "#B42318",
     "no_description": "#B42318", "incomplete": "#B42318", "unreadable": "#B42318",
+    "skipped": "#A16207",
     "duplicate_different": "#A16207", "duplicate_identical": "#A16207",
 }

@@ -9,6 +9,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 import copy
 import io
+import math
+import random
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -95,6 +97,9 @@ OPTIONAL = {
     "association_name",
     "association_code",
 }
+GROWTH_STAGES = ("مرحلة النمو الخضري", "مرحلة الإنبات", "مرحلة الإزهار والإثمار")
+FRUITING_CROPS = ("عنب", "برتقال", "كاكا", "كاكاو", "جوافه")
+ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
 class TextExtractor(HTMLParser):
@@ -148,6 +153,35 @@ def _tidy(value: str) -> str:
     return value.strip(" \t\n\r|;؛،,")
 
 
+def normalize_arabic(value: str) -> str:
+    """Normalize values only for matching rules; preserve original export text."""
+    text = (value or "").translate(ARABIC_DIGITS).casefold()
+    text = re.sub(r"[ًٌٍَُِّْـ]", "", text)
+    return (
+        text.replace("أ", "ا")
+        .replace("إ", "ا")
+        .replace("آ", "ا")
+        .replace("ة", "ه")
+        .strip()
+    )
+
+
+def is_unallocated(data: dict[str, str]) -> bool:
+    holding = normalize_arabic(data.get("holding_number", "")).replace(" ", "")
+    # The source normally includes "غير محيز" in notes, but the holding number
+    # itself is the authoritative business indicator.
+    return holding in {"0", "-1", "0.0", "-1.0"}
+
+
+def is_agricultural(data: dict[str, str]) -> bool:
+    return "زراع" in normalize_arabic(data.get("land_use", ""))
+
+
+def must_use_fruiting_stage(data: dict[str, str]) -> bool:
+    crop = normalize_arabic(data.get("crop_type", ""))
+    return any(crop == name or crop.startswith(name + " ") for name in FRUITING_CROPS)
+
+
 def parse_description(
     description: str | None, extended: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -185,11 +219,19 @@ def parse_description(
     result["id"] = result["id"].lower().strip()
     # Area can be one phrase ("0 فدان، 4 قيراط، 0 سهم") or separate fields.
     # Resolve it from the complete text after generic parsing so Arabic commas are safe.
-    for key, tokens in {"feddan": ["فدان"], "qirat": ["قيراط", "قراط"], "sahm": ["سهم"]}.items():
+    for key, tokens in {
+        "feddan": ["فدان"],
+        "qirat": ["قيراط", "قراط"],
+        "sahm": ["سهم"],
+    }.items():
         for token in tokens:
-            number = re.search(rf"([0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)\s*{re.escape(token)}\b", text)
+            number = re.search(
+                rf"([0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)\s*{re.escape(token)}\b", text
+            )
             if not number:
-                number = re.search(rf"{re.escape(token)}\s*[:：]\s*([0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)", text)
+                number = re.search(
+                    rf"{re.escape(token)}\s*[:：]\s*([0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)", text
+                )
             if number:
                 result[key] = number.group(1)
                 break
@@ -200,33 +242,131 @@ def is_uuid(value: str) -> bool:
     return bool(UUID_RE.fullmatch((value or "").strip()))
 
 
+def local_name(tag: str) -> str:
+    """Read an XML tag name without making assumptions about its namespace."""
+    return tag.rsplit("}", 1)[-1].casefold()
+
+
+def direct_child(element: ET.Element, tag: str) -> ET.Element | None:
+    expected = tag.casefold()
+    return next((child for child in element if local_name(child.tag) == expected), None)
+
+
 def title_id(title: str) -> str:
     return title.strip().lower() if is_uuid(title) else ""
 
 
 def element_text(element: ET.Element, tag: str) -> str:
-    node = element.find(f"k:{tag}", NS)
+    node = direct_child(element, tag)
     return (node.text or "").strip() if node is not None else ""
+
+
+def element_markup(element: ET.Element, tag: str) -> str:
+    """Return all content inside a KML node, including nested author HTML/XML.
+
+    KML descriptions are usually CDATA, but some exporters write real child nodes
+    (`table`, `div`, etc.) inside ``description``. Reading only ``node.text`` drops
+    those child nodes and makes a populated parcel look empty.
+    """
+    node = direct_child(element, tag)
+    if node is None:
+        return ""
+    parts = [node.text or ""]
+    parts.extend(ET.tostring(child, encoding="unicode") for child in node)
+    return "".join(parts).strip()
 
 
 def set_element_text(element: ET.Element, tag: str, value: str) -> None:
     node = element.find(f"k:{tag}", NS)
     if node is None:
+        # Replace a foreign-namespace counterpart so output always uses the
+        # standard KML field understood by Google Earth and later imports.
+        foreign_node = direct_child(element, tag)
+        if foreign_node is not None:
+            element.remove(foreign_node)
         node = ET.SubElement(element, f"{{{KML_NS}}}{tag}")
+    # A description may contain nested author-controlled HTML/XML. Remove it before
+    # writing normalized direct text so no hidden markup survives in the export.
+    for child in list(node):
+        node.remove(child)
     node.text = value
 
 
 def extract_extended_data(placemark: ET.Element) -> dict[str, str]:
     values: dict[str, str] = {}
-    for data in placemark.findall(".//k:ExtendedData/k:Data", NS):
-        name = data.get("name", "")
-        value = data.find("k:value", NS)
-        if name and value is not None and value.text:
-            values[name] = value.text
-    for data in placemark.findall(".//k:ExtendedData/k:SchemaData/k:SimpleData", NS):
-        if data.get("name") and data.text:
-            values[data.get("name", "")] = data.text
+    for data in placemark.iter():
+        tag = local_name(data.tag)
+        if tag == "data":
+            name = data.get("name", "")
+            value = direct_child(data, "value")
+            content = element_markup(data, "value") if value is not None else data.get("value", "")
+            if name and content:
+                values[name] = clean_description(content)
+        elif tag == "simpledata" and data.get("name") and "".join(data.itertext()).strip():
+            values[data.get("name", "")] = clean_description("".join(data.itertext()))
     return values
+
+
+def fallback_description(placemark: ET.Element) -> str:
+    """Collect description-like fields stored under non-standard KML namespaces.
+
+    Several GIS exporters place popup content in a namespaced `description`,
+    `snippet`, or value field. Google Earth renders it, while a namespace-specific
+    reader sees an empty description. This fallback intentionally excludes geometry
+    and titles and only collects fields that can contain human-readable attributes.
+    """
+    fragments: list[str] = []
+    for node in placemark.iter():
+        if node is placemark or local_name(node.tag) not in {"description", "snippet", "value", "simpledata"}:
+            continue
+        content = "".join(node.itertext()).strip()
+        if content:
+            fragments.append(content)
+    return "\n".join(dict.fromkeys(fragments))
+
+
+def element_attribute(element: ET.Element, name: str) -> str:
+    """Get an attribute whether it is plain or namespace-qualified."""
+    expected = name.casefold()
+    for key, value in element.attrib.items():
+        if local_name(key) == expected:
+            return value
+    return ""
+
+
+def descendant_text(element: ET.Element, tag: str) -> str:
+    expected = tag.casefold()
+    for node in element.iter():
+        if local_name(node.tag) == expected:
+            return "".join(node.itertext()).strip()
+    return ""
+
+
+def balloon_text_by_style(root: ET.Element) -> dict[str, str]:
+    """Map KML/GX style IDs to popup text stored in BalloonStyle.
+
+    Google Earth Projects commonly stores a parcel's attribute text on the
+    ``gx:CascadingStyle`` referenced by ``Placemark/styleUrl``. The popup looks
+    populated in Google Earth even though the Placemark itself has no description.
+    """
+    styles: dict[str, str] = {}
+    for container in root.iter():
+        if local_name(container.tag) not in {"style", "cascadingstyle"}:
+            continue
+        style_id = element_attribute(container, "id")
+        if not style_id:
+            continue
+        balloon = next((node for node in container.iter() if local_name(node.tag) == "balloonstyle"), None)
+        text = descendant_text(balloon, "text") if balloon is not None else ""
+        if text:
+            styles[style_id.lstrip("#")] = text
+            # Google Earth Projects references the shared base ID from Placemark
+            # while defining the actual popup on `<base>_normal` and
+            # `<base>_highlight` cascading styles.
+            for suffix in ("_normal", "_highlight"):
+                if style_id.endswith(suffix):
+                    styles.setdefault(style_id[: -len(suffix)].lstrip("#"), text)
+    return styles
 
 
 def geometry_coordinates(placemark: ET.Element) -> str:
@@ -235,6 +375,64 @@ def geometry_coordinates(placemark: ET.Element) -> str:
         for node in placemark.findall(".//k:Polygon//k:coordinates", NS)
     ]
     return " | ".join(c for c in coords if c)
+
+
+def _dms(value: float, positive: str, negative: str) -> str:
+    direction = positive if value >= 0 else negative
+    absolute = abs(value)
+    degrees = int(absolute)
+    minutes_float = (absolute - degrees) * 60
+    minutes = int(minutes_float)
+    seconds = round((minutes_float - minutes) * 60, 2)
+    if seconds >= 60:
+        seconds, minutes = 0, minutes + 1
+    if minutes >= 60:
+        minutes, degrees = 0, degrees + 1
+    return f'{degrees}°{minutes}\'{seconds:05.2f}"{direction}'
+
+
+def search_coordinate(coordinates: str) -> str:
+    """Return a Google-Earth-friendly DMS point at the first polygon's centroid."""
+    first_ring = (coordinates or "").split("|", 1)[0].strip()
+    points: list[tuple[float, float]] = []
+    for raw_point in first_ring.split():
+        parts = raw_point.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            points.append((float(parts[0]), float(parts[1])))  # longitude, latitude
+        except ValueError:
+            continue
+    if len(points) > 1 and points[0] == points[-1]:
+        points.pop()
+    if not points:
+        return ""
+    if len(points) < 3:
+        longitude = sum(point[0] for point in points) / len(points)
+        latitude = sum(point[1] for point in points) / len(points)
+    else:
+        area_twice = sum(
+            points[index][0] * points[(index + 1) % len(points)][1]
+            - points[(index + 1) % len(points)][0] * points[index][1]
+            for index in range(len(points))
+        )
+        if abs(area_twice) < 1e-12:
+            longitude = sum(point[0] for point in points) / len(points)
+            latitude = sum(point[1] for point in points) / len(points)
+        else:
+            longitude = sum(
+                (points[index][0] + points[(index + 1) % len(points)][0])
+                * (points[index][0] * points[(index + 1) % len(points)][1]
+                   - points[(index + 1) % len(points)][0] * points[index][1])
+                for index in range(len(points))
+            ) / (3 * area_twice)
+            latitude = sum(
+                (points[index][1] + points[(index + 1) % len(points)][1])
+                * (points[index][0] * points[(index + 1) % len(points)][1]
+                   - points[(index + 1) % len(points)][0] * points[index][1])
+                for index in range(len(points))
+            ) / (3 * area_twice)
+    return f"{_dms(latitude, 'N', 'S')} {_dms(longitude, 'E', 'W')}"
 
 
 def has_polygon(placemark: ET.Element) -> bool:
@@ -266,13 +464,20 @@ class Parcel:
     review_confirmed: bool = False
     retained_review: bool = False
     auto_fixed: bool = False
+    validation_skipped: bool = False
 
     @property
     def id(self) -> str:
         return self.data.get("id", "")
 
     @property
+    def search_coordinate(self) -> str:
+        return search_coordinate(self.coordinates)
+
+    @property
     def blocking(self) -> bool:
+        if self.status == "skipped":
+            return False
         return self.status in {
             "empty",
             "no_description",
@@ -283,11 +488,13 @@ class Parcel:
 
 STATUS_LABELS = {
     "valid": "سليمة",
+    "unallocated": "غير محيزة",
     "title_mismatch": "عنوان غير مطابق",
     "empty": "فارغة",
     "no_description": "بلا وصف",
     "incomplete": "بيانات ناقصة",
     "unreadable": "غير قابلة للقراءة",
+    "skipped": "تم تجاوز النواقص",
     "duplicate_different": "ID مكرر وبيانات مختلفة",
     "duplicate_identical": "ID مكرر وبيانات متطابقة",
 }
@@ -327,12 +534,20 @@ class KmlDocument:
             root = ET.fromstring(raw)
         except ET.ParseError as exc:
             raise ValueError(f"ملف KML غير صالح: {exc}") from exc
+        style_texts = balloon_text_by_style(root)
         parcels = []
         for index, mark in enumerate(root.findall(".//k:Placemark", NS), start=1):
             if not has_polygon(mark):
                 continue
             title = element_text(mark, "name")
-            description = element_text(mark, "description")
+            description = element_markup(mark, "description")
+            fallback = fallback_description(mark)
+            if fallback and fallback not in description:
+                description = "\n".join(part for part in [description, fallback] if part)
+            style_id = element_text(mark, "styleUrl").lstrip("#")
+            balloon_text = style_texts.get(style_id, "")
+            if balloon_text and balloon_text not in description:
+                description = "\n".join(part for part in [description, balloon_text] if part)
             data = parse_description(description, extract_extended_data(mark))
             parcels.append(
                 Parcel(
@@ -368,6 +583,11 @@ class KmlDocument:
                     "incomplete",
                     "حقول إلزامية ناقصة: " + "، ".join(parcel.missing),
                 )
+            elif is_unallocated(parcel.data):
+                parcel.status, parcel.reason = (
+                    "unallocated",
+                    "بيانات مكتملة — قطعة غير محيزة.",
+                )
             elif title_id(parcel.title) != parcel.id:
                 parcel.status, parcel.reason = (
                     "title_mismatch",
@@ -375,6 +595,20 @@ class KmlDocument:
                 )
             else:
                 parcel.status, parcel.reason = "valid", "البيانات والعنوان متطابقان."
+
+            # A reviewer may explicitly allow a record through with blanks.  Keep
+            # the missing-field list visible for traceability, but do not let it
+            # block export or keep the parcel in the blocking-review queue.
+            if parcel.validation_skipped and parcel.status in {
+                "empty",
+                "no_description",
+                "incomplete",
+                "unreadable",
+            }:
+                parcel.status, parcel.reason = (
+                    "skipped",
+                    "تم تجاوز النواقص يدويًا؛ ستبقى الحقول الناقصة فارغة.",
+                )
             if retain_review and parcel.status == "valid":
                 parcel.status, parcel.reason = (
                     "duplicate_identical",
@@ -447,9 +681,16 @@ class KmlDocument:
         set_element_text(parcel.element, "description", parcel.description)
 
     def update_parcel(
-        self, parcel: Parcel, values: dict[str, str], confirmed: bool = False
+        self,
+        parcel: Parcel,
+        values: dict[str, str],
+        confirmed: bool = False,
+        skip_missing: bool = False,
     ) -> None:
         parcel.data.update({key: values.get(key, "").strip() for key, _ in FIELDS})
+        # A standard save re-enables validation.  The bypass is deliberate and
+        # only persists when the reviewer chooses the dedicated action.
+        parcel.validation_skipped = skip_missing
         parcel.title = parcel.data.get("id", "")
         parcel.description = canonical_description(parcel.data)
         set_element_text(parcel.element, "name", parcel.title)
@@ -475,6 +716,58 @@ class KmlDocument:
             set_element_text(parcel.element, "description", parcel.description)
         self.analyze()
 
+    def distribute_growth_stages(
+        self,
+        percentages: dict[str, str | float | int],
+        rng: random.Random | None = None,
+    ) -> int:
+        """Replace extracted growth stages using the per-file user distribution."""
+        ratios: dict[str, float] = {}
+        for stage in GROWTH_STAGES:
+            raw = (
+                str(percentages.get(stage, ""))
+                .translate(ARABIC_DIGITS)
+                .replace("٪", "")
+                .strip()
+            )
+            try:
+                ratios[stage] = float(raw)
+            except ValueError as exc:
+                raise ValueError("أدخل نسبة رقمية لكل مرحلة نمو.") from exc
+            if ratios[stage] < 0:
+                raise ValueError("نسب مراحل النمو لا يمكن أن تكون سالبة.")
+        if not math.isclose(sum(ratios.values()), 100.0, abs_tol=0.01):
+            raise ValueError("يجب أن يكون مجموع نسب مراحل النمو 100٪.")
+
+        agricultural = [p for p in self.parcels if is_agricultural(p.data)]
+        variable = [p for p in agricultural if not must_use_fruiting_stage(p.data)]
+        for parcel in self.parcels:
+            if not is_agricultural(parcel.data):
+                parcel.data["growth_stage"] = ""
+        for parcel in agricultural:
+            if must_use_fruiting_stage(parcel.data):
+                parcel.data["growth_stage"] = GROWTH_STAGES[2]
+
+        raw_counts = {stage: len(variable) * ratios[stage] / 100 for stage in GROWTH_STAGES}
+        counts = {stage: math.floor(value) for stage, value in raw_counts.items()}
+        remaining = len(variable) - sum(counts.values())
+        ranking = sorted(
+            GROWTH_STAGES,
+            key=lambda stage: raw_counts[stage] - counts[stage],
+            reverse=True,
+        )
+        for stage in ranking[:remaining]:
+            counts[stage] += 1
+        assignments = [stage for stage in GROWTH_STAGES for _ in range(counts[stage])]
+        (rng or random.SystemRandom()).shuffle(assignments)
+        for parcel, stage in zip(variable, assignments):
+            parcel.data["growth_stage"] = stage
+        for parcel in self.parcels:
+            parcel.description = canonical_description(parcel.data)
+            set_element_text(parcel.element, "description", parcel.description)
+        self.analyze()
+        return len(agricultural)
+
     def summary(self) -> Counter:
         counts = Counter(parcel.status for parcel in self.parcels)
         counts["total"] = len(self.parcels)
@@ -485,6 +778,8 @@ class KmlDocument:
     def _style_id(self, parcel: Parcel) -> str:
         if parcel.status in {"empty", "no_description", "incomplete", "unreadable"}:
             return "parcel-red"
+        if parcel.status == "skipped":
+            return "parcel-yellow"
         if parcel.review_required and not parcel.review_confirmed:
             return "parcel-yellow"
         assoc = parcel.data.get("association_name", "")
@@ -500,10 +795,11 @@ class KmlDocument:
             if old.get("id", "").startswith("parcel-"):
                 container.remove(old)
         styles = {
-            "parcel-blue": ("ccff6600", "ffcc6600"),
-            "parcel-cyan": ("ccffff00", "ffffff00"),
-            "parcel-yellow": ("cc00ffff", "ff00ffff"),
-            "parcel-red": ("ff0000ff", "ff0000ff"),
+            # KML colour format is aabbggrr. Only blocking red is 75% opaque.
+            "parcel-blue": ("00ff6600", "ffcc6600"),
+            "parcel-cyan": ("00ffff00", "ffffff00"),
+            "parcel-yellow": ("0000ffff", "ff00ffff"),
+            "parcel-red": ("bf0000ff", "ff0000ff"),
         }
         for style_id, (fill, line) in styles.items():
             style = ET.Element(f"{{{KML_NS}}}Style", {"id": style_id})
