@@ -137,8 +137,11 @@ class MainWindow(QMainWindow):
             ("مرحلة الإنبات", "نسبة الإنبات %"),
             ("مرحلة الإزهار والإثمار", "نسبة الإزهار/الإثمار %"),
         ]:
-            field = QLineEdit(); field.setPlaceholderText(placeholder); field.setMaxLength(3)
-            field.setValidator(QIntValidator(0, 100, self)); field.textChanged.connect(self.update_growth_total)
+            field = QLineEdit()
+            field.setPlaceholderText(placeholder)
+            field.setMaxLength(3)
+            field.setValidator(QIntValidator(0, 100, self))
+            field.textChanged.connect(self.update_growth_total)
             self.growth_inputs[stage] = field
         self.growth_total = QLabel("المجموع: 0٪ — أدخل 100٪")
         self.growth_total.setObjectName("muted")
@@ -218,10 +221,14 @@ class MainWindow(QMainWindow):
         valid = complete and total == 100
         if valid:
             self.growth_total.setText("المجموع: 100٪ — جاهز للتوزيع")
-            self.growth_total.setStyleSheet("color:#166534;font-weight:700;background:transparent;")
+            self.growth_total.setStyleSheet(
+                "color:#166534;font-weight:700;background:transparent;"
+            )
         else:
             self.growth_total.setText(f"المجموع: {total}٪ — يجب أن يساوي 100٪")
-            self.growth_total.setStyleSheet("color:#B42318;font-weight:700;background:transparent;")
+            self.growth_total.setStyleSheet(
+                "color:#B42318;font-weight:700;background:transparent;"
+            )
         self.growth_distribution.setEnabled(bool(self.document) and valid)
 
     def load_file(self) -> None:
